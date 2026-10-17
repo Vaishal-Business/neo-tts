@@ -1,5 +1,0 @@
-
-streamlit>=1.41,<2
-pocket-tts==3.3.0
-numpy>=1.26,<3
-tornado>=6.4,<7

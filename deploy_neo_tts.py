@@ -20,7 +20,7 @@ after the first sentence. The safety factor self-tunes: the client reports
 late chunks (underruns) and the server raises safety; clean turns lower it.
 smooth mode (one AudioBuffer, zero risk) remains available per request.
 """
-import os, sys, re, io, json, time, glob, base64, shutil, threading, subprocess, queue
+import os, sys, re, io, json, time, glob, base64, shutil, threading, subprocess, queue, collections, concurrent.futures
 import importlib.util, urllib.request, urllib.error
 from pathlib import Path
 
@@ -43,7 +43,7 @@ MODEL_FILE = _env("NEO_MODEL_FILE", "Llama-3.2-1B-Instruct-Q4_K_M.gguf")
 # emit immediate EOS = "0 tok/s". For Qwen2.5-0.5B Q4_K_M (~400 MB) set NEO_MODEL_MIN_MB=350.
 MODEL_MIN_BYTES = int(float(_env("NEO_MODEL_MIN_MB", "700")) * 1e6)
 AUDIO_MODE = _env("NEO_AUDIO_MODE", "adaptive").lower()
-TTS_BACKEND = _env("NEO_TTS_BACKEND", "auto").lower()   # auto | pocket | kokoro
+TTS_BACKEND = _env("NEO_TTS_BACKEND", "pocket").lower()   # pocket (your voice, auto-tuned) | auto | kokoro
 KOKORO_VOICE = _env("NEO_KOKORO_VOICE", "af_heart")
 MAX_TURNS = 10            # rolling window of user/assistant pairs
 MAX_TOKENS = int(_env("NEO_MAX_TOKENS", "90"))
@@ -251,9 +251,16 @@ import numpy as np
 class TTSBackend:
     name = "base"
     sample_rate = 24000
+    parallel = 1            # how many sentences can be synthesised at once
+    @property
+    def executor(self):
+        if not hasattr(self, "_ex"):
+            self._ex = concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel)
+        return self._ex
     def load(self): raise NotImplementedError
     def synth(self, text):  # -> float32 mono ndarray
         raise NotImplementedError
+    def close(self): pass
 
 def find_voice():
     for p in (HERE / "voice.safetensors", Path("/content/neo-tts/voice.safetensors"), STATE_DIR / "voice.safetensors"):
@@ -261,28 +268,115 @@ def find_voice():
             return p
     return None
 
+def _to_np(a):
+    return np.asarray(a.detach().cpu().numpy() if hasattr(a, "detach") else a, dtype=np.float32).reshape(-1)
+
 class PocketBackend(TTSBackend):
-    name = "pocket-tts"
+    """One in-process model. quant=int8 or fp32, threads=torch intra-op threads."""
+    def __init__(self, quant=True, threads=2):
+        self.quant, self.threads = quant, threads
+        self.name = f"pocket-tts ({'int8' if quant else 'fp32'}, {threads} threads)"
     def load(self):
         import torch
-        torch.set_num_threads(2)
+        torch.set_num_threads(self.threads)
         from pocket_tts import TTSModel
-        try:
-            self.model = TTSModel.load_model(quantize=True)   # int8
-        except TypeError as e:
-            log(f"load_model(quantize=True) unsupported ({e}); loading fp32")
+        if self.quant:
+            try:
+                self.model = TTSModel.load_model(quantize=True)
+            except TypeError as e:
+                log(f"load_model(quantize=True) unsupported ({e}); loading fp32")
+                self.model = TTSModel.load_model()
+        else:
             self.model = TTSModel.load_model()
         vp = find_voice()
         if vp is None:
             log("WARNING: voice.safetensors not found; using the built-in default voice")
             self.voice = self.model.get_state_for_audio_prompt("alba")
         else:
-            log(f"voice: {vp}")
             self.voice = self.model.get_state_for_audio_prompt(str(vp))
         self.sample_rate = int(self.model.sample_rate)
     def synth(self, text):
-        a = self.model.generate_audio(self.voice, text)
-        return np.asarray(a.detach().cpu().numpy() if hasattr(a, "detach") else a, dtype=np.float32).reshape(-1)
+        import torch
+        torch.set_num_threads(self.threads)
+        return _to_np(self.model.generate_audio(self.voice, text))
+    def close(self):
+        self.model = None
+
+# Worker for PocketPoolBackend. Separate PROCESSES, not threads: one autoregressive stream scales
+# poorly past 1 thread (tiny matrices, sync overhead), so two single-thread processes working on
+# two sentences give close to 2x aggregate throughput on 2 vCPUs. A subprocess (not multiprocessing)
+# is used because spawn cannot import functions defined in a notebook's __main__.
+_POCKET_WORKER_SRC = r"""
+import sys, json
+proto = sys.stdout.buffer
+sys.stdout = sys.stderr          # library prints must never corrupt the binary protocol
+import numpy as np, torch
+torch.set_num_threads(1)
+voice, quant = sys.argv[1], sys.argv[2] == "1"
+from pocket_tts import TTSModel
+try:
+    model = TTSModel.load_model(quantize=True) if quant else TTSModel.load_model()
+except TypeError:
+    model = TTSModel.load_model()
+state = model.get_state_for_audio_prompt(voice)
+proto.write((json.dumps({"ready": True, "sr": int(model.sample_rate)}) + "\n").encode()); proto.flush()
+for line in sys.stdin:
+    try:
+        a = model.generate_audio(state, json.loads(line)["text"])
+        a = np.asarray(a.detach().cpu().numpy() if hasattr(a, "detach") else a, dtype=np.float32).reshape(-1)
+        proto.write((json.dumps({"n": int(a.size)}) + "\n").encode()); proto.write(a.tobytes())
+    except Exception as e:
+        proto.write((json.dumps({"error": repr(e)}) + "\n").encode())
+    proto.flush()
+"""
+
+class PocketPoolBackend(TTSBackend):
+    def __init__(self, n=2, quant=True):
+        self.n, self.quant, self.parallel = n, quant, n
+        self.name = f"pocket-tts ({'int8' if quant else 'fp32'}, {n} procs x 1 thread)"
+    def load(self):
+        wp = Path("/tmp/neo_pocket_worker.py")
+        wp.write_text(_POCKET_WORKER_SRC)
+        vp = find_voice()
+        if vp is None:
+            log("WARNING: voice.safetensors not found; using the built-in default voice")
+        env = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
+        self.procs, self.free = [], queue.Queue()
+        for k in range(self.n):   # start all first so the models load in parallel
+            err = open(f"/tmp/neo_pocket_worker_{k}.log", "w")
+            p = subprocess.Popen([sys.executable, str(wp), str(vp) if vp else "alba", "1" if self.quant else "0"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, env=env)
+            self.procs.append(p)
+        for k, p in enumerate(self.procs):
+            line = p.stdout.readline()
+            if not line:
+                tail = Path(f"/tmp/neo_pocket_worker_{k}.log").read_text(errors="ignore")[-600:]
+                raise RuntimeError(f"pocket worker {k} died on startup: {tail}")
+            self.sample_rate = int(json.loads(line)["sr"])
+            self.free.put(p)
+    def synth(self, text):
+        p = self.free.get()
+        try:
+            p.stdin.write((json.dumps({"text": text}) + "\n").encode()); p.stdin.flush()
+            hdr = p.stdout.readline()
+            if not hdr:
+                raise RuntimeError("pocket worker died mid-synthesis")
+            h = json.loads(hdr)
+            if "error" in h:
+                raise RuntimeError(h["error"])
+            need = h["n"] * 4
+            buf = p.stdout.read(need)
+            if len(buf) != need:
+                raise RuntimeError("short read from pocket worker")
+            return np.frombuffer(buf, dtype=np.float32).copy()
+        finally:
+            self.free.put(p)
+    def close(self):
+        for p in getattr(self, "procs", []):
+            try:
+                p.kill()
+            except OSError as e:
+                log(f"worker kill: {e!r}")
 
 class KokoroBackend(TTSBackend):
     name = "kokoro-82m-int8"
@@ -416,6 +510,8 @@ TURN_LOCK = threading.Lock()   # LLM and TTS share 2 vCPUs: never run them concu
 CANCEL = threading.Event()
 SERVER = None
 _FRESH = False
+TTS_SERIAL = False
+FILLERS = []
 
 def reset_history():
     HISTORY[:] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -459,47 +555,140 @@ def boot_models():
     LLM.create_chat_completion(messages=[HISTORY[0], {"role": "user", "content": "hi"}], max_tokens=1)
     reset_history()
     log("selecting TTS backend")
-    TTS = select_tts()
+    TTS, ratio = select_tts()
+    finalize_tts(ratio)
+    try:
+        FILLERS[:] = build_fillers()
+    except Exception as e:
+        log(f"fillers unavailable: {e!r}")
 
 def _measure(b):
+    """Returns (chars, audio_seconds, wall_seconds_per_stream). With P parallel workers, wall is divided by P:
+    it is the aggregate throughput that decides whether playback can keep up."""
     probe = "This is a short test of the voice engine."
-    b.synth("Hello.")                       # first call pays one-off graph/compile cost
-    t = time.perf_counter(); a = b.synth(probe); wall = time.perf_counter() - t
-    audio = len(a) / b.sample_rate
-    return len(probe), audio, wall
+    P = max(1, b.parallel)
+    for f in [b.executor.submit(b.synth, "Hello.") for _ in range(P)]:   # first call pays one-off graph cost
+        f.result()
+    t = time.perf_counter()
+    outs = [f.result() for f in [b.executor.submit(b.synth, probe) for _ in range(P)]]
+    wall = (time.perf_counter() - t) / P
+    return len(probe), len(outs[0]) / b.sample_rate, wall
+
+def _cpu_key():
+    try:
+        for l in open("/proc/cpuinfo"):
+            if l.startswith("model name"):
+                return l.split(":", 1)[1].strip()
+    except OSError as e:
+        log(f"cpuinfo unreadable: {e!r}")
+    return "unknown"
+
+def tune_pocket():
+    """Find the fastest way to run YOUR voice on THIS CPU. Candidates differ in int8 vs fp32 (int8 can be
+    slower at batch 1) and in-process threads vs two single-thread worker processes. First boot tries them
+    (about a minute); the winner is cached on Drive per CPU model, later boots load only the winner."""
+    cands = {"pool2_int8": lambda: PocketPoolBackend(2, True), "inproc_int8": lambda: PocketBackend(True, 2),
+             "pool2_fp32": lambda: PocketPoolBackend(2, False), "inproc_fp32": lambda: PocketBackend(False, 2)}
+    tf, key, cached = STATE_DIR / "pocket_tuning.json", _cpu_key(), None
+    try:
+        cached = json.loads(tf.read_text())
+    except FileNotFoundError:
+        pass
+    except ValueError as e:
+        log(f"tuning cache unreadable: {e!r}")
+    if cached and cached.get("cpu") == key and cached.get("best") in cands:
+        b = cands[cached["best"]](); b.load()
+        log(f"pocket-tts variant from cache: {b.name}")
+        return b, _measure(b)
+    log("first boot on this CPU: benchmarking pocket-tts variants (cached afterwards)")
+    best, results = None, {}
+    for name, mk in cands.items():
+        try:
+            b = mk(); b.load(); m = _measure(b)
+        except Exception as e:
+            log(f"variant {name} failed: {e!r}")
+            continue
+        ratio = m[2] / m[1]; results[name] = round(ratio, 2)
+        log(f"  {b.name}: wall/audio = {ratio:.2f}")
+        if best is None or ratio < best[0]:
+            if best: best[2].close()
+            best = (ratio, name, b, m)
+        else:
+            b.close()
+        if ratio <= 0.5:
+            break
+    if best is None:
+        raise RuntimeError("no pocket-tts variant could be loaded")
+    try:
+        tf.write_text(json.dumps({"cpu": key, "best": best[1], "ratios": results}))
+    except OSError as e:
+        log(f"could not write tuning cache: {e!r}")
+    return best[2], best[3]
+
+def finalize_tts(ratio):
+    """Adapt the whole pipeline to how fast the voice really is."""
+    global TTS_SERIAL, SYSTEM_PROMPT, MAX_TOKENS
+    # Slow voice: synthesising while the LLM runs only splits 2 cores two ways (same finish time, more
+    # cache thrash) and forces the gate to guess the unwritten text. So wait for the text, then it is exact.
+    TTS_SERIAL = ratio > 0.55
+    if ratio > 1.0:
+        # Slower than real time: audio length is the cost, so keep replies to one short sentence.
+        SYSTEM_PROMPT = SYSTEM_PROMPT.replace("one or two short sentences, under thirty words in total",
+                                              "one short sentence, under fifteen words")
+        MAX_TOKENS = min(MAX_TOKENS, 48)
+        reset_history()
+    log(f"pipeline: serial={TTS_SERIAL}, max_tokens={MAX_TOKENS}, parallel voice workers={TTS.parallel}")
+
+FILLER_TEXTS = ["Okay.", "Sure thing.", "Let me see."]
+
+def build_fillers():
+    """Short acknowledgements in YOUR voice, rendered once and cached on Drive. The browser plays one the
+    instant you send, so sound starts at 0 ms even though the real answer takes seconds to prepare."""
+    import hashlib
+    vp = find_voice()
+    h = hashlib.sha1(vp.read_bytes() if vp else b"default"); h.update(TTS.name.encode())
+    cache = STATE_DIR / f"fillers_{h.hexdigest()[:12]}.json"
+    try:
+        return json.loads(cache.read_text())
+    except FileNotFoundError:
+        pass
+    except ValueError as e:
+        log(f"filler cache unreadable: {e!r}")
+    outl = []
+    for f in [TTS.executor.submit(TTS.synth, t) for t in FILLER_TEXTS]:
+        pcm = f.result()
+        outl.append({"sr": TTS.sample_rate, "dur": len(pcm) / TTS.sample_rate, "pcm": pcm_b64(pcm)})
+    try:
+        cache.write_text(json.dumps(outl))
+    except OSError as e:
+        log(f"could not cache fillers: {e!r}")
+    return outl
 
 def select_tts():
-    """auto: keep the custom PocketTTS voice only if it is fast enough to stream while the LLM is running.
-    wall/audio must be well under 1.0, because TTS and LLM share 2 vCPUs and both slow down when overlapped.
-    Your measured pocket-tts ratio was 1.9: it cannot stream gap-free no matter how it is scheduled,
-    so auto switches to Kokoro (usually 0.3-0.6) and logs the decision. Force with NEO_TTS_BACKEND=pocket."""
+    """pocket (default): your custom voice, auto-tuned for speed. kokoro: forced Kokoro.
+    auto: pocket, but fall back to Kokoro if even the tuned pocket is slower than ~0.9x real time."""
     if TTS_BACKEND == "kokoro":
         b = make_backend()
         c, a, w = _measure(b); PACE.seed(c, a, w)
         log(f"TTS {b.name}: wall/audio = {w/a:.2f}")
-        return b
-    b = PocketBackend(); b.load()
-    c, a, w = _measure(b)
+        return b, w / a
+    b, (c, a, w) = tune_pocket()
     ratio = w / a
-    log(f"TTS pocket-tts: {w:.2f}s wall for {a:.2f}s audio (wall/audio = {ratio:.2f}; >1 means slower than real time)")
+    log(f"TTS {b.name}: aggregate wall/audio = {ratio:.2f} (<1.0 = faster than real time)")
     if TTS_BACKEND == "auto" and ratio > 0.9:
-        log("pocket-tts is too slow to stream gap-free next to the LLM; trying Kokoro")
+        log("pocket-tts still too slow to stream gap-free next to the LLM; trying Kokoro")
         try:
             k = KokoroBackend(); k.load()
             kc, ka, kw = _measure(k)
-            kr = kw / ka
-            log(f"TTS {k.name}: {kw:.2f}s wall for {ka:.2f}s audio (wall/audio = {kr:.2f})")
-            if kr < ratio:
-                log(f"USING {k.name} (voice is Kokoro '{KOKORO_VOICE}', not your custom voice). Set NEO_TTS_BACKEND=pocket to force yours.")
-                del b
-                import gc; gc.collect()
-                PACE.seed(kc, ka, kw)
-                return k
+            if kw / ka < ratio:
+                log(f"USING {k.name} ({kw/ka:.2f}); voice is Kokoro '{KOKORO_VOICE}', not your custom voice")
+                b.close(); PACE.seed(kc, ka, kw)
+                return k, kw / ka
             log("Kokoro was not faster; keeping pocket-tts")
         except Exception as e:
             log(f"Kokoro unavailable ({e!r}); keeping pocket-tts")
     PACE.seed(c, a, w)
-    return b
+    return b, ratio
 
 # ===== THE TURN PIPELINE (LLM -> sentences -> TTS -> client, all overlapped) =====
 _BOUND = re.compile(r"[.!?][\"')\]]*\s")
@@ -577,54 +766,67 @@ def turn_events(user_text, mode, tts_on, max_tokens):
                     out.put(("_end",))
 
         def tts_worker():
-            pcms, buffered, i, went, sr = [], 0.0, 0, False, TTS.sample_rate
+            pcms, buffered, went, sr, last_k = [], 0.0, False, TTS.sample_rate, -1
+            P = max(1, TTS.parallel)
+            inflight, eof, idx = collections.deque(), False, 0
+            def timed(text):
+                t = time.perf_counter(); p = TTS.synth(text); return p, time.perf_counter() - t
             try:
-                while True:
-                    try:
-                        item = sq.get(timeout=0.2)
-                    except queue.Empty:
-                        if CANCEL.is_set():
+                while not CANCEL.is_set():
+                    if TTS_SERIAL and not st["llm_done"]:
+                        time.sleep(0.05)       # slow voice: let the LLM have both cores; text is then fully known
+                        continue
+                    while not eof and len(inflight) < P:     # keep every voice worker busy
+                        try:
+                            item = sq.get(timeout=0.05) if not inflight else sq.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is None:
+                            eof = True
+                            break
+                        inflight.append((idx, item, TTS.executor.submit(timed, item))); idx += 1
+                    if not inflight:
+                        if eof:
                             break
                         continue
-                    if item is None or CANCEL.is_set():
-                        break
-                    out.put({"type": "status", "stage": "synth", "i": i})   # also keeps the tunnel warm
+                    k, text, fut = inflight.popleft()
+                    out.put({"type": "status", "stage": "synth", "i": k})   # also keeps the tunnel warm
                     try:
-                        t = time.perf_counter(); pcm = TTS.synth(item); dt = time.perf_counter() - t
+                        pcm, dt = fut.result()
                     except Exception as e:
-                        print(f"[tts] sentence {i} failed: {e!r}", flush=True)
-                        out.put({"type": "error", "message": f"tts failed on sentence {i}: {e!r}"})
-                        i += 1
+                        print(f"[tts] sentence {k} failed: {e!r}", flush=True)
+                        out.put({"type": "error", "message": f"tts failed on sentence {k}: {e!r}"})
                         continue
                     sr = TTS.sample_rate
-                    st["tts_wall"] += dt; st["speech"] += len(pcm) / sr; st["chars_done"] += len(item)
+                    # dt/P: with P workers busy at once, aggregate wall per audio second is dt/P
+                    st["tts_wall"] += dt / P; st["speech"] += len(pcm) / sr; st["chars_done"] += len(text)
                     pcm = np.concatenate([pcm, np.zeros(int(PAD_S * sr), np.float32)])
-                    i += 1
+                    last_k = k
                     if mode == "smooth":
                         pcms.append(pcm)
                         continue
                     buffered += len(pcm) / sr
-                    out.put({"type": "sentence_audio", "i": i - 1, "sr": sr, "pcm": pcm_b64(pcm)})
+                    out.put({"type": "sentence_audio", "i": k, "sr": sr, "pcm": pcm_b64(pcm)})
                     if not went:
                         if mode == "stream":
                             ok = True
                         else:
                             with sq.mutex:
-                                pending = [len(x) for x in list(sq.queue) if x]
+                                pending = [len(t) for _, t, _ in inflight] + [len(x) for x in list(sq.queue) if x]
                             # text the LLM has not written yet: expect a typical reply length, at least one more sentence
-                            fut = 0 if st["llm_done"] else max(50, int(PACE.reply * 1.25) - st["chars"])
-                            ok = PACE.gate(buffered, pending, st["speech"], st["chars_done"], st["tts_wall"], fut)
+                            fut_chars = 0 if st["llm_done"] else max(50, int(PACE.reply * 1.25) - st["chars"])
+                            ok = PACE.gate(buffered, pending, st["speech"], st["chars_done"], st["tts_wall"], fut_chars)
                         if ok:
                             went = True
                             st["go_s"] = time.perf_counter() - t_req
-                            out.put({"type": "go", "after_sentence": i - 1, "buffered_s": round(buffered, 2)})
+                            out.put({"type": "go", "after_sentence": k, "buffered_s": round(buffered, 2)})
                 if mode == "smooth" and pcms and not CANCEL.is_set():
                     full = np.concatenate(pcms)
                     st["go_s"] = time.perf_counter() - t_req
                     out.put({"type": "audio_full", "sr": sr, "dur": len(full) / sr, "pcm": pcm_b64(full)})
                 elif mode != "smooth" and not went and buffered > 0:
                     st["go_s"] = time.perf_counter() - t_req
-                    out.put({"type": "go", "after_sentence": i - 1, "buffered_s": round(buffered, 2)})
+                    out.put({"type": "go", "after_sentence": last_k, "buffered_s": round(buffered, 2)})
             except Exception as e:
                 print(f"[tts] worker failed: {e!r}", flush=True)
                 out.put({"type": "error", "message": f"tts worker failed: {e!r}"})
@@ -691,7 +893,7 @@ def turn_events(user_text, mode, tts_on, max_tokens):
                     HISTORY.pop()
 
 # ===== WEB APP =====
-_UI_B64 = "PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj48aGVhZD48bWV0YSBjaGFyc2V0PSJ1dGYtOCI+CjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsaW5pdGlhbC1zY2FsZT0xLHZpZXdwb3J0LWZpdD1jb3ZlciI+Cjx0aXRsZT5uZW8tdHRzPC90aXRsZT4KPHN0eWxlPgo6cm9vdHstLWJnOiMxMjE1MWE7LS1wYW5lbDojMWExZTI1Oy0tZmc6I2U5ZWJmMDstLW11dDojOGU5N2E4Oy0tbGluZTojMmEzMDNiOy0tYWNjOiM3ZmQ2YzI7LS1tZTojMjMyYTM2fQpAbWVkaWEgKHByZWZlcnMtY29sb3Itc2NoZW1lOmxpZ2h0KXs6cm9vdHstLWJnOiNmNGY1Zjc7LS1wYW5lbDojZmZmOy0tZmc6IzE2MWEyMTstLW11dDojNWY2ODc5Oy0tbGluZTojZGRlMWU5Oy0tYWNjOiMwZjdmNmE7LS1tZTojZThlY2YzfX0KKntib3gtc2l6aW5nOmJvcmRlci1ib3h9Cmh0bWwsYm9keXtoZWlnaHQ6MTAwJTttYXJnaW46MH0KYm9keXtiYWNrZ3JvdW5kOnZhcigtLWJnKTtjb2xvcjp2YXIoLS1mZyk7Zm9udDoxNnB4LzEuNSBzeXN0ZW0tdWksLWFwcGxlLXN5c3RlbSwiU2Vnb2UgVUkiLHNhbnMtc2VyaWY7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjttYXgtd2lkdGg6NzYwcHg7bWFyZ2luOjAgYXV0bztwYWRkaW5nOmVudihzYWZlLWFyZWEtaW5zZXQtdG9wKSAxMnB4IGVudihzYWZlLWFyZWEtaW5zZXQtYm90dG9tKX0KaGVhZGVye2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjEwcHg7cGFkZGluZzoxNHB4IDRweDtib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1saW5lKX0KaDF7Zm9udC1zaXplOjE3cHg7bWFyZ2luOjA7Zm9udC13ZWlnaHQ6NjAwO2xldHRlci1zcGFjaW5nOi4ycHh9CiNjaGlwe2NvbG9yOnZhcigtLW11dCk7Zm9udC1zaXplOjEzcHg7ZmxleDoxfQpzZWxlY3QsYnV0dG9uLGlucHV0e2ZvbnQ6aW5oZXJpdDtjb2xvcjp2YXIoLS1mZyl9CnNlbGVjdHtiYWNrZ3JvdW5kOnZhcigtLXBhbmVsKTtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6OHB4O3BhZGRpbmc6NnB4IDhweH0KI2xvZ3tmbGV4OjE7b3ZlcmZsb3cteTphdXRvO3BhZGRpbmc6MTZweCAycHg7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjtnYXA6MTJweH0KLm17bWF4LXdpZHRoOjg4JTtwYWRkaW5nOjEwcHggMTRweDtib3JkZXItcmFkaXVzOjE0cHg7d2hpdGUtc3BhY2U6cHJlLXdyYXA7d29yZC13cmFwOmJyZWFrLXdvcmR9Ci51e2FsaWduLXNlbGY6ZmxleC1lbmQ7YmFja2dyb3VuZDp2YXIoLS1tZSl9Ci5he2FsaWduLXNlbGY6ZmxleC1zdGFydDtiYWNrZ3JvdW5kOnZhcigtLXBhbmVsKTtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpfQoubWV0YXtmb250LXNpemU6MTJweDtjb2xvcjp2YXIoLS1tdXQpO21hcmdpbi10b3A6NnB4fQojc3RhdHVze21pbi1oZWlnaHQ6MjBweDtmb250LXNpemU6MTNweDtjb2xvcjp2YXIoLS1hY2MpO3BhZGRpbmc6MCA0cHh9CmZvcm17ZGlzcGxheTpmbGV4O2dhcDo4cHg7cGFkZGluZzoxMHB4IDAgMTRweH0KaW5wdXR7ZmxleDoxO2JhY2tncm91bmQ6dmFyKC0tcGFuZWwpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxMnB4O3BhZGRpbmc6MTJweCAxNHB4fQppbnB1dDpmb2N1cy12aXNpYmxlLGJ1dHRvbjpmb2N1cy12aXNpYmxlLHNlbGVjdDpmb2N1cy12aXNpYmxle291dGxpbmU6MnB4IHNvbGlkIHZhcigtLWFjYyk7b3V0bGluZS1vZmZzZXQ6MnB4fQpidXR0b257YmFja2dyb3VuZDp2YXIoLS1hY2MpO2NvbG9yOiMwYjEyMTA7Ym9yZGVyOjA7Ym9yZGVyLXJhZGl1czoxMnB4O3BhZGRpbmc6MCAxOHB4O2ZvbnQtd2VpZ2h0OjYwMDtjdXJzb3I6cG9pbnRlcn0KYnV0dG9uLmdob3N0e2JhY2tncm91bmQ6dHJhbnNwYXJlbnQ7Y29sb3I6dmFyKC0tZmcpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSl9CmJ1dHRvbjpkaXNhYmxlZHtvcGFjaXR5Oi41O2N1cnNvcjpkZWZhdWx0fQo8L3N0eWxlPjwvaGVhZD4KPGJvZHk+CjxoZWFkZXI+PGgxPm5lby10dHM8L2gxPjxzcGFuIGlkPSJjaGlwIj5jb25uZWN0aW5nPC9zcGFuPgo8c2VsZWN0IGlkPSJtb2RlIiB0aXRsZT0iQXVkaW8gbW9kZSI+PG9wdGlvbiB2YWx1ZT0iYWRhcHRpdmUiPkFkYXB0aXZlPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0ic21vb3RoIj5TbW9vdGg8L29wdGlvbj48b3B0aW9uIHZhbHVlPSJzdHJlYW0iPlN0cmVhbTwvb3B0aW9uPjwvc2VsZWN0Pgo8YnV0dG9uIGNsYXNzPSJnaG9zdCIgaWQ9InJlc2V0IiB0eXBlPSJidXR0b24iPk5ldyBjaGF0PC9idXR0b24+PC9oZWFkZXI+CjxkaXYgaWQ9ImxvZyIgYXJpYS1saXZlPSJwb2xpdGUiPjwvZGl2Pgo8ZGl2IGlkPSJzdGF0dXMiPjwvZGl2Pgo8Zm9ybSBpZD0iZiI+PGlucHV0IGlkPSJxIiBhdXRvY29tcGxldGU9Im9mZiIgcGxhY2Vob2xkZXI9IlR5cGUgYSBtZXNzYWdlIiBhcmlhLWxhYmVsPSJNZXNzYWdlIj48YnV0dG9uIGlkPSJzZW5kIj5TZW5kPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0iZ2hvc3QiIGlkPSJzdG9wIiB0eXBlPSJidXR0b24iIGRpc2FibGVkPlN0b3A8L2J1dHRvbj48L2Zvcm0+CjxzY3JpcHQ+CiJ1c2Ugc3RyaWN0IjsKY29uc3QgJCA9IHMgPT4gZG9jdW1lbnQucXVlcnlTZWxlY3RvcihzKTsKY29uc3QgQSA9IHtjdHg6IG51bGwsIHNyOiAyNDAwMCwgaGVhZDogMCwgc3RhcnRlZDogZmFsc2UsIHF1ZXVlOiBbXSwgbGF0ZTogMCwgc291cmNlczogW119OwpsZXQgY3RybCA9IG51bGw7CgpmdW5jdGlvbiBlbnN1cmVDdHgoc3IpIHsKICBpZiAoQS5jdHggJiYgQS5jdHguc2FtcGxlUmF0ZSA9PT0gc3IpIHJldHVybjsKICBpZiAoQS5jdHgpIEEuY3R4LmNsb3NlKCk7CiAgQS5zciA9IHNyOwogIC8vIEZpeGVkIDI0IGtIeiBjb250ZXh0OiB0aGUgZGVmYXVsdCA0OCBrSHogY29udGV4dCByZXNhbXBsZXMgb3VyIGJ1ZmZlcnMgYW5kIGNyYWNrbGVzLgogIEEuY3R4ID0gbmV3ICh3aW5kb3cuQXVkaW9Db250ZXh0IHx8IHdpbmRvdy53ZWJraXRBdWRpb0NvbnRleHQpKHtzYW1wbGVSYXRlOiBzciwgbGF0ZW5jeUhpbnQ6ICJwbGF5YmFjayJ9KTsKfQpmdW5jdGlvbiByZXNldEF1ZGlvKCkgewogIGZvciAoY29uc3QgcyBvZiBBLnNvdXJjZXMpIHsgdHJ5IHsgcy5zdG9wKCk7IH0gY2F0Y2ggKGUpIHsgY29uc29sZS53YXJuKCJzdG9wIiwgZSk7IH0gfQogIEEuc291cmNlcyA9IFtdOyBBLmhlYWQgPSAwOyBBLnN0YXJ0ZWQgPSBmYWxzZTsgQS5xdWV1ZSA9IFtdOyBBLmxhdGUgPSAwOwp9CmZ1bmN0aW9uIHBjbVRvRjMyKGI2NCkgewogIGNvbnN0IGJpbiA9IGF0b2IoYjY0KSwgbiA9IGJpbi5sZW5ndGggPj4gMSwgb3V0ID0gbmV3IEZsb2F0MzJBcnJheShuKTsKICBmb3IgKGxldCBpID0gMDsgaSA8IG47IGkrKykgewogICAgbGV0IHYgPSBiaW4uY2hhckNvZGVBdCgyICogaSkgfCAoYmluLmNoYXJDb2RlQXQoMiAqIGkgKyAxKSA8PCA4KTsKICAgIGlmICh2ICYgMHg4MDAwKSB2IC09IDB4MTAwMDA7CiAgICBvdXRbaV0gPSB2IC8gMzI3Njg7CiAgfQogIHJldHVybiBvdXQ7Cn0KZnVuY3Rpb24gZmFkZShmLCBpbk1zLCBvdXRNcykgewogIGNvbnN0IG5pID0gTWF0aC5taW4oZi5sZW5ndGggPj4gMSwgTWF0aC5yb3VuZChBLnNyICogaW5NcyAvIDEwMDApKSwgbm8gPSBNYXRoLm1pbihmLmxlbmd0aCA+PiAxLCBNYXRoLnJvdW5kKEEuc3IgKiBvdXRNcyAvIDEwMDApKTsKICBmb3IgKGxldCBpID0gMDsgaSA8IG5pOyBpKyspIGZbaV0gKj0gaSAvIG5pOwogIGZvciAobGV0IGkgPSAwOyBpIDwgbm87IGkrKykgZltmLmxlbmd0aCAtIDEgLSBpXSAqPSBpIC8gbm87CiAgcmV0dXJuIGY7Cn0KZnVuY3Rpb24gc2NoZWR1bGUoZikgewogIGNvbnN0IGJ1ZiA9IEEuY3R4LmNyZWF0ZUJ1ZmZlcigxLCBmLmxlbmd0aCwgQS5zcik7CiAgYnVmLmNvcHlUb0NoYW5uZWwoZiwgMCk7CiAgY29uc3Qgc3JjID0gQS5jdHguY3JlYXRlQnVmZmVyU291cmNlKCk7CiAgc3JjLmJ1ZmZlciA9IGJ1Zjsgc3JjLmNvbm5lY3QoQS5jdHguZGVzdGluYXRpb24pOwogIGNvbnN0IG5vdyA9IEEuY3R4LmN1cnJlbnRUaW1lOwogIGlmIChBLmhlYWQgPCBub3cgKyAwLjAxKSB7ICAgICAgICAgICAgLy8gY2h1bmsgYXJyaXZlZCBhZnRlciB0aGUgcXVldWUgcmFuIGRyeTogYW4gYXVkaWJsZSBnYXAKICAgIGlmIChBLnN0YXJ0ZWQgJiYgQS5oZWFkID4gMCkgQS5sYXRlKys7CiAgICBBLmhlYWQgPSBub3cgKyAwLjA2OwogIH0KICBzcmMuc3RhcnQoQS5oZWFkKTsgICAgICAgICAgICAgICAgICAgIC8vIHNhbXBsZS1hY2N1cmF0ZTogaGVhZCBhZHZhbmNlcyBieSBleGFjdCBidWZmZXIgZHVyYXRpb24KICBBLmhlYWQgKz0gYnVmLmR1cmF0aW9uOwogIEEuc291cmNlcy5wdXNoKHNyYyk7Cn0KZnVuY3Rpb24gZ28oKSB7CiAgaWYgKEEuc3RhcnRlZCkgcmV0dXJuOwogIEEuc3RhcnRlZCA9IHRydWU7IEEuaGVhZCA9IEEuY3R4LmN1cnJlbnRUaW1lICsgMC4wODsKICBmb3IgKGNvbnN0IGYgb2YgQS5xdWV1ZSkgc2NoZWR1bGUoZik7CiAgQS5xdWV1ZSA9IFtdOwp9CgpmdW5jdGlvbiBidWJibGUoY2xzLCB0ZXh0KSB7CiAgY29uc3QgZCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpOyBkLmNsYXNzTmFtZSA9ICJtICIgKyBjbHM7IGQudGV4dENvbnRlbnQgPSB0ZXh0OwogICQoIiNsb2ciKS5hcHBlbmRDaGlsZChkKTsgJCgiI2xvZyIpLnNjcm9sbFRvcCA9IDFlOTsgcmV0dXJuIGQ7Cn0KCmFzeW5jIGZ1bmN0aW9uIHNlbmQodGV4dCkgewogIGVuc3VyZUN0eChBLnNyKTsgYXdhaXQgQS5jdHgucmVzdW1lKCk7IHJlc2V0QXVkaW8oKTsKICBidWJibGUoInUiLCB0ZXh0KTsKICBjb25zdCBvdXQgPSBidWJibGUoImEiLCAiIik7IGNvbnN0IG1ldGEgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTsgbWV0YS5jbGFzc05hbWUgPSAibWV0YSI7IG91dC5hcHBlbmRDaGlsZChtZXRhKTsKICBjb25zdCBib2R5ID0gZG9jdW1lbnQuY3JlYXRlVGV4dE5vZGUoIiIpOyBvdXQuaW5zZXJ0QmVmb3JlKGJvZHksIG1ldGEpOwogIGN0cmwgPSBuZXcgQWJvcnRDb250cm9sbGVyKCk7CiAgJCgiI3NlbmQiKS5kaXNhYmxlZCA9IHRydWU7ICQoIiNzdG9wIikuZGlzYWJsZWQgPSBmYWxzZTsKICB0cnkgewogICAgY29uc3QgcmVzID0gYXdhaXQgZmV0Y2goIi9jaGF0Iiwge21ldGhvZDogIlBPU1QiLCBoZWFkZXJzOiB7IkNvbnRlbnQtVHlwZSI6ICJhcHBsaWNhdGlvbi9qc29uIn0sCiAgICAgIGJvZHk6IEpTT04uc3RyaW5naWZ5KHttZXNzYWdlOiB0ZXh0LCBtb2RlOiAkKCIjbW9kZSIpLnZhbHVlfSksIHNpZ25hbDogY3RybC5zaWduYWx9KTsKICAgIGNvbnN0IHJkID0gcmVzLmJvZHkuZ2V0UmVhZGVyKCksIGRlYyA9IG5ldyBUZXh0RGVjb2RlcigpOyBsZXQgYnVmID0gIiI7CiAgICBmb3IgKDs7KSB7CiAgICAgIGNvbnN0IHt2YWx1ZSwgZG9uZX0gPSBhd2FpdCByZC5yZWFkKCk7IGlmIChkb25lKSBicmVhazsKICAgICAgYnVmICs9IGRlYy5kZWNvZGUodmFsdWUsIHtzdHJlYW06IHRydWV9KTsKICAgICAgbGV0IGk7CiAgICAgIHdoaWxlICgoaSA9IGJ1Zi5pbmRleE9mKCJcbiIpKSA+PSAwKSB7CiAgICAgICAgY29uc3QgbGluZSA9IGJ1Zi5zbGljZSgwLCBpKTsgYnVmID0gYnVmLnNsaWNlKGkgKyAxKTsKICAgICAgICBpZiAobGluZS50cmltKCkpIGhhbmRsZShKU09OLnBhcnNlKGxpbmUpLCBib2R5LCBtZXRhKTsKICAgICAgfQogICAgfQogIH0gY2F0Y2ggKGUpIHsKICAgIGlmIChlLm5hbWUgIT09ICJBYm9ydEVycm9yIikgeyBtZXRhLnRleHRDb250ZW50ID0gIkNvbm5lY3Rpb24gcHJvYmxlbTogIiArIGUubWVzc2FnZTsgY29uc29sZS5lcnJvcihlKTsgfQogIH0KICBpZiAoIUEuc3RhcnRlZCAmJiBBLnF1ZXVlLmxlbmd0aCkgZ28oKTsgICAvLyBmYWxsYmFjazogbmV2ZXIgbGVhdmUgYXVkaW8gdW5wbGF5ZWQKICBmZXRjaCgiL2ZlZWRiYWNrIiwge21ldGhvZDogIlBPU1QiLCBoZWFkZXJzOiB7IkNvbnRlbnQtVHlwZSI6ICJhcHBsaWNhdGlvbi9qc29uIn0sIGJvZHk6IEpTT04uc3RyaW5naWZ5KHtsYXRlOiBBLmxhdGV9KX0pCiAgICAuY2F0Y2goZSA9PiBjb25zb2xlLndhcm4oImZlZWRiYWNrIiwgZSkpOwogICQoIiNzdGF0dXMiKS50ZXh0Q29udGVudCA9ICIiOyAkKCIjc2VuZCIpLmRpc2FibGVkID0gZmFsc2U7ICQoIiNzdG9wIikuZGlzYWJsZWQgPSB0cnVlOyAkKCIjcSIpLmZvY3VzKCk7Cn0KCmZ1bmN0aW9uIGhhbmRsZShldiwgYm9keSwgbWV0YSkgewogIHN3aXRjaCAoZXYudHlwZSkgewogICAgY2FzZSAibWV0YSI6CiAgICAgIGlmIChldi5zYW1wbGVfcmF0ZSAhPT0gQS5zcikgeyBlbnN1cmVDdHgoZXYuc2FtcGxlX3JhdGUpOyBBLmN0eC5yZXN1bWUoKTsgfQogICAgICAkKCIjY2hpcCIpLnRleHRDb250ZW50ID0gZXYuYmFja2VuZDsgYnJlYWs7CiAgICBjYXNlICJ0ZXh0IjogYm9keS5ub2RlVmFsdWUgKz0gZXYuZGVsdGE7ICQoIiNsb2ciKS5zY3JvbGxUb3AgPSAxZTk7IGJyZWFrOwogICAgY2FzZSAic3RhdHVzIjogJCgiI3N0YXR1cyIpLnRleHRDb250ZW50ID0gIlByZXBhcmluZyB2b2ljZSwgc2VudGVuY2UgIiArIChldi5pICsgMSk7IGJyZWFrOwogICAgY2FzZSAic2VudGVuY2VfYXVkaW8iOiB7CiAgICAgIGNvbnN0IGYgPSBmYWRlKHBjbVRvRjMyKGV2LnBjbSksIDMsIDMpOwogICAgICBpZiAoQS5zdGFydGVkKSBzY2hlZHVsZShmKTsgZWxzZSBBLnF1ZXVlLnB1c2goZik7CiAgICAgIGJyZWFrOyB9CiAgICBjYXNlICJnbyI6IGdvKCk7ICQoIiNzdGF0dXMiKS50ZXh0Q29udGVudCA9ICJTcGVha2luZyI7IGJyZWFrOwogICAgY2FzZSAiYXVkaW9fZnVsbCI6IHsKICAgICAgY29uc3QgZiA9IGZhZGUocGNtVG9GMzIoZXYucGNtKSwgNSwgMTUpOwogICAgICBBLnF1ZXVlLnB1c2goZik7IGdvKCk7ICQoIiNzdGF0dXMiKS50ZXh0Q29udGVudCA9ICJTcGVha2luZyI7IGJyZWFrOyB9CiAgICBjYXNlICJlcnJvciI6IG1ldGEudGV4dENvbnRlbnQgPSBldi5tZXNzYWdlOyBicmVhazsKICAgIGNhc2UgIm1ldHJpY3MiOiB7CiAgICAgIGNvbnN0IG0gPSBldjsKICAgICAgbWV0YS50ZXh0Q29udGVudCA9IChtLnRva19zID8/ICI/IikgKyAiIHRvay9zLCBmaXJzdCB0ZXh0ICIgKyAobS50dGZ0X3MgPz8gIj8iKSArICIgcywgdm9pY2Ugc3RhcnRzICIgKyAobS5hdWRpb19zdGFydF9zID8/ICJuL2EiKSArICIgcywgdm9pY2UgYnVpbHQgYXQgIiArIChtLnR0c193YWxsX3Blcl9hdWRpbyA/PyAibi9hIikgKyAieCBhdWRpbyBsZW5ndGgsICIgKyBtLm1vZGU7CiAgICAgIGJyZWFrOyB9CiAgICBjYXNlICJkb25lIjogYnJlYWs7CiAgfQp9CgokKCIjZiIpLmFkZEV2ZW50TGlzdGVuZXIoInN1Ym1pdCIsIGUgPT4geyBlLnByZXZlbnREZWZhdWx0KCk7IGNvbnN0IHQgPSAkKCIjcSIpLnZhbHVlLnRyaW0oKTsgaWYgKCF0KSByZXR1cm47ICQoIiNxIikudmFsdWUgPSAiIjsgc2VuZCh0KTsgfSk7CiQoIiNzdG9wIikuYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCAoKSA9PiB7IGZldGNoKCIvY2FuY2VsIiwge21ldGhvZDogIlBPU1QifSk7IGlmIChjdHJsKSBjdHJsLmFib3J0KCk7IHJlc2V0QXVkaW8oKTsgfSk7CiQoIiNyZXNldCIpLmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIiwgYXN5bmMgKCkgPT4geyBhd2FpdCBmZXRjaCgiL3Jlc2V0Iiwge21ldGhvZDogIlBPU1QifSk7ICQoIiNsb2ciKS5pbm5lckhUTUwgPSAiIjsgcmVzZXRBdWRpbygpOyB9KTsKZmV0Y2goIi9jb25maWciKS50aGVuKHIgPT4gci5qc29uKCkpLnRoZW4oYyA9PiB7IEEuc3IgPSBjLnNhbXBsZV9yYXRlOyAkKCIjbW9kZSIpLnZhbHVlID0gYy5hdWRpb19tb2RlOyAkKCIjY2hpcCIpLnRleHRDb250ZW50ID0gYy5iYWNrZW5kICsgIiAvICIgKyBjLm1vZGVsOyB9KQogIC5jYXRjaChlID0+IHsgJCgiI2NoaXAiKS50ZXh0Q29udGVudCA9ICJzZXJ2ZXIgbm90IHJlYWNoYWJsZSI7IGNvbnNvbGUuZXJyb3IoZSk7IH0pOwo8L3NjcmlwdD48L2JvZHk+PC9odG1sPgo="
+_UI_B64 = "PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj48aGVhZD48bWV0YSBjaGFyc2V0PSJ1dGYtOCI+CjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsaW5pdGlhbC1zY2FsZT0xLHZpZXdwb3J0LWZpdD1jb3ZlciI+Cjx0aXRsZT5uZW8tdHRzPC90aXRsZT4KPHN0eWxlPgo6cm9vdHstLWJnOiMxMjE1MWE7LS1wYW5lbDojMWExZTI1Oy0tZmc6I2U5ZWJmMDstLW11dDojOGU5N2E4Oy0tbGluZTojMmEzMDNiOy0tYWNjOiM3ZmQ2YzI7LS1tZTojMjMyYTM2fQpAbWVkaWEgKHByZWZlcnMtY29sb3Itc2NoZW1lOmxpZ2h0KXs6cm9vdHstLWJnOiNmNGY1Zjc7LS1wYW5lbDojZmZmOy0tZmc6IzE2MWEyMTstLW11dDojNWY2ODc5Oy0tbGluZTojZGRlMWU5Oy0tYWNjOiMwZjdmNmE7LS1tZTojZThlY2YzfX0KKntib3gtc2l6aW5nOmJvcmRlci1ib3h9Cmh0bWwsYm9keXtoZWlnaHQ6MTAwJTttYXJnaW46MH0KYm9keXtiYWNrZ3JvdW5kOnZhcigtLWJnKTtjb2xvcjp2YXIoLS1mZyk7Zm9udDoxNnB4LzEuNSBzeXN0ZW0tdWksLWFwcGxlLXN5c3RlbSwiU2Vnb2UgVUkiLHNhbnMtc2VyaWY7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjttYXgtd2lkdGg6NzYwcHg7bWFyZ2luOjAgYXV0bztwYWRkaW5nOmVudihzYWZlLWFyZWEtaW5zZXQtdG9wKSAxMnB4IGVudihzYWZlLWFyZWEtaW5zZXQtYm90dG9tKX0KaGVhZGVye2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjEwcHg7cGFkZGluZzoxNHB4IDRweDtib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1saW5lKX0KaDF7Zm9udC1zaXplOjE3cHg7bWFyZ2luOjA7Zm9udC13ZWlnaHQ6NjAwO2xldHRlci1zcGFjaW5nOi4ycHh9CiNjaGlwe2NvbG9yOnZhcigtLW11dCk7Zm9udC1zaXplOjEzcHg7ZmxleDoxfQpzZWxlY3QsYnV0dG9uLGlucHV0e2ZvbnQ6aW5oZXJpdDtjb2xvcjp2YXIoLS1mZyl9CmxhYmVsLmNoa3tmb250LXNpemU6MTNweDtjb2xvcjp2YXIoLS1tdXQpO2Rpc3BsYXk6ZmxleDtnYXA6NHB4O2FsaWduLWl0ZW1zOmNlbnRlcn0Kc2VsZWN0e2JhY2tncm91bmQ6dmFyKC0tcGFuZWwpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo4cHg7cGFkZGluZzo2cHggOHB4fQojbG9ne2ZsZXg6MTtvdmVyZmxvdy15OmF1dG87cGFkZGluZzoxNnB4IDJweDtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2dhcDoxMnB4fQoubXttYXgtd2lkdGg6ODglO3BhZGRpbmc6MTBweCAxNHB4O2JvcmRlci1yYWRpdXM6MTRweDt3aGl0ZS1zcGFjZTpwcmUtd3JhcDt3b3JkLXdyYXA6YnJlYWstd29yZH0KLnV7YWxpZ24tc2VsZjpmbGV4LWVuZDtiYWNrZ3JvdW5kOnZhcigtLW1lKX0KLmF7YWxpZ24tc2VsZjpmbGV4LXN0YXJ0O2JhY2tncm91bmQ6dmFyKC0tcGFuZWwpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSl9Ci5tZXRhe2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dCk7bWFyZ2luLXRvcDo2cHh9CiNzdGF0dXN7bWluLWhlaWdodDoyMHB4O2ZvbnQtc2l6ZToxM3B4O2NvbG9yOnZhcigtLWFjYyk7cGFkZGluZzowIDRweH0KZm9ybXtkaXNwbGF5OmZsZXg7Z2FwOjhweDtwYWRkaW5nOjEwcHggMCAxNHB4fQppbnB1dHtmbGV4OjE7YmFja2dyb3VuZDp2YXIoLS1wYW5lbCk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxMnB4IDE0cHh9CmlucHV0OmZvY3VzLXZpc2libGUsYnV0dG9uOmZvY3VzLXZpc2libGUsc2VsZWN0OmZvY3VzLXZpc2libGV7b3V0bGluZToycHggc29saWQgdmFyKC0tYWNjKTtvdXRsaW5lLW9mZnNldDoycHh9CmJ1dHRvbntiYWNrZ3JvdW5kOnZhcigtLWFjYyk7Y29sb3I6IzBiMTIxMDtib3JkZXI6MDtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzowIDE4cHg7Zm9udC13ZWlnaHQ6NjAwO2N1cnNvcjpwb2ludGVyfQpidXR0b24uZ2hvc3R7YmFja2dyb3VuZDp0cmFuc3BhcmVudDtjb2xvcjp2YXIoLS1mZyk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKX0KYnV0dG9uOmRpc2FibGVke29wYWNpdHk6LjU7Y3Vyc29yOmRlZmF1bHR9Cjwvc3R5bGU+PC9oZWFkPgo8Ym9keT4KPGhlYWRlcj48aDE+bmVvLXR0czwvaDE+PHNwYW4gaWQ9ImNoaXAiPmNvbm5lY3Rpbmc8L3NwYW4+CjxzZWxlY3QgaWQ9Im1vZGUiIHRpdGxlPSJBdWRpbyBtb2RlIj48b3B0aW9uIHZhbHVlPSJhZGFwdGl2ZSI+QWRhcHRpdmU8L29wdGlvbj48b3B0aW9uIHZhbHVlPSJzbW9vdGgiPlNtb290aDwvb3B0aW9uPjxvcHRpb24gdmFsdWU9InN0cmVhbSI+U3RyZWFtPC9vcHRpb24+PC9zZWxlY3Q+CjxsYWJlbCBjbGFzcz0iY2hrIj48aW5wdXQgdHlwZT0iY2hlY2tib3giIGlkPSJmaWxsIiBjaGVja2VkPiBRdWljayBhY2s8L2xhYmVsPjxidXR0b24gY2xhc3M9Imdob3N0IiBpZD0icmVzZXQiIHR5cGU9ImJ1dHRvbiI+TmV3IGNoYXQ8L2J1dHRvbj48L2hlYWRlcj4KPGRpdiBpZD0ibG9nIiBhcmlhLWxpdmU9InBvbGl0ZSI+PC9kaXY+CjxkaXYgaWQ9InN0YXR1cyI+PC9kaXY+Cjxmb3JtIGlkPSJmIj48aW5wdXQgaWQ9InEiIGF1dG9jb21wbGV0ZT0ib2ZmIiBwbGFjZWhvbGRlcj0iVHlwZSBhIG1lc3NhZ2UiIGFyaWEtbGFiZWw9Ik1lc3NhZ2UiPjxidXR0b24gaWQ9InNlbmQiPlNlbmQ8L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJnaG9zdCIgaWQ9InN0b3AiIHR5cGU9ImJ1dHRvbiIgZGlzYWJsZWQ+U3RvcDwvYnV0dG9uPjwvZm9ybT4KPHNjcmlwdD4KInVzZSBzdHJpY3QiOwpjb25zdCAkID0gcyA9PiBkb2N1bWVudC5xdWVyeVNlbGVjdG9yKHMpOwpjb25zdCBBID0ge2N0eDogbnVsbCwgc3I6IDI0MDAwLCBoZWFkOiAwLCBzdGFydGVkOiBmYWxzZSwgcXVldWU6IFtdLCBsYXRlOiAwLCBzb3VyY2VzOiBbXX07CmxldCBjdHJsID0gbnVsbCwgZmlsbGVycyA9IFtdLCBmaSA9IDA7CmZldGNoKCIvZmlsbGVycyIpLnRoZW4ociA9PiByLmpzb24oKSkudGhlbihmID0+IHsgZmlsbGVycyA9IGY7IH0pLmNhdGNoKGUgPT4gY29uc29sZS53YXJuKCJmaWxsZXJzIiwgZSkpOwpmdW5jdGlvbiBwbGF5RmlsbGVyKCkgewogIGlmICghJCgiI2ZpbGwiKS5jaGVja2VkIHx8ICFmaWxsZXJzLmxlbmd0aCkgcmV0dXJuOwogIGNvbnN0IGYgPSBmaWxsZXJzW2ZpKysgJSBmaWxsZXJzLmxlbmd0aF07CiAgaWYgKGYuc3IgIT09IEEuc3IpIHJldHVybjsKICBBLmhlYWQgPSBBLmN0eC5jdXJyZW50VGltZSArIDAuMDM7ICAgIC8vIHBsYXlzIGF0IG9uY2UsIGJlZm9yZSB0aGUgc2VydmVyIGhhcyBwcm9kdWNlZCBhbnl0aGluZwogIHNjaGVkdWxlKGZhZGUocGNtVG9GMzIoZi5wY20pLCAzLCAxMCkpOwp9CgpmdW5jdGlvbiBlbnN1cmVDdHgoc3IpIHsKICBpZiAoQS5jdHggJiYgQS5jdHguc2FtcGxlUmF0ZSA9PT0gc3IpIHJldHVybjsKICBpZiAoQS5jdHgpIEEuY3R4LmNsb3NlKCk7CiAgQS5zciA9IHNyOwogIC8vIEZpeGVkIDI0IGtIeiBjb250ZXh0OiB0aGUgZGVmYXVsdCA0OCBrSHogY29udGV4dCByZXNhbXBsZXMgb3VyIGJ1ZmZlcnMgYW5kIGNyYWNrbGVzLgogIEEuY3R4ID0gbmV3ICh3aW5kb3cuQXVkaW9Db250ZXh0IHx8IHdpbmRvdy53ZWJraXRBdWRpb0NvbnRleHQpKHtzYW1wbGVSYXRlOiBzciwgbGF0ZW5jeUhpbnQ6ICJwbGF5YmFjayJ9KTsKfQpmdW5jdGlvbiByZXNldEF1ZGlvKCkgewogIGZvciAoY29uc3QgcyBvZiBBLnNvdXJjZXMpIHsgdHJ5IHsgcy5zdG9wKCk7IH0gY2F0Y2ggKGUpIHsgY29uc29sZS53YXJuKCJzdG9wIiwgZSk7IH0gfQogIEEuc291cmNlcyA9IFtdOyBBLmhlYWQgPSAwOyBBLnN0YXJ0ZWQgPSBmYWxzZTsgQS5xdWV1ZSA9IFtdOyBBLmxhdGUgPSAwOwp9CmZ1bmN0aW9uIHBjbVRvRjMyKGI2NCkgewogIGNvbnN0IGJpbiA9IGF0b2IoYjY0KSwgbiA9IGJpbi5sZW5ndGggPj4gMSwgb3V0ID0gbmV3IEZsb2F0MzJBcnJheShuKTsKICBmb3IgKGxldCBpID0gMDsgaSA8IG47IGkrKykgewogICAgbGV0IHYgPSBiaW4uY2hhckNvZGVBdCgyICogaSkgfCAoYmluLmNoYXJDb2RlQXQoMiAqIGkgKyAxKSA8PCA4KTsKICAgIGlmICh2ICYgMHg4MDAwKSB2IC09IDB4MTAwMDA7CiAgICBvdXRbaV0gPSB2IC8gMzI3Njg7CiAgfQogIHJldHVybiBvdXQ7Cn0KZnVuY3Rpb24gZmFkZShmLCBpbk1zLCBvdXRNcykgewogIGNvbnN0IG5pID0gTWF0aC5taW4oZi5sZW5ndGggPj4gMSwgTWF0aC5yb3VuZChBLnNyICogaW5NcyAvIDEwMDApKSwgbm8gPSBNYXRoLm1pbihmLmxlbmd0aCA+PiAxLCBNYXRoLnJvdW5kKEEuc3IgKiBvdXRNcyAvIDEwMDApKTsKICBmb3IgKGxldCBpID0gMDsgaSA8IG5pOyBpKyspIGZbaV0gKj0gaSAvIG5pOwogIGZvciAobGV0IGkgPSAwOyBpIDwgbm87IGkrKykgZltmLmxlbmd0aCAtIDEgLSBpXSAqPSBpIC8gbm87CiAgcmV0dXJuIGY7Cn0KZnVuY3Rpb24gc2NoZWR1bGUoZikgewogIGNvbnN0IGJ1ZiA9IEEuY3R4LmNyZWF0ZUJ1ZmZlcigxLCBmLmxlbmd0aCwgQS5zcik7CiAgYnVmLmNvcHlUb0NoYW5uZWwoZiwgMCk7CiAgY29uc3Qgc3JjID0gQS5jdHguY3JlYXRlQnVmZmVyU291cmNlKCk7CiAgc3JjLmJ1ZmZlciA9IGJ1Zjsgc3JjLmNvbm5lY3QoQS5jdHguZGVzdGluYXRpb24pOwogIGNvbnN0IG5vdyA9IEEuY3R4LmN1cnJlbnRUaW1lOwogIGlmIChBLmhlYWQgPCBub3cgKyAwLjAxKSB7ICAgICAgICAgICAgLy8gY2h1bmsgYXJyaXZlZCBhZnRlciB0aGUgcXVldWUgcmFuIGRyeTogYW4gYXVkaWJsZSBnYXAKICAgIGlmIChBLnN0YXJ0ZWQgJiYgQS5oZWFkID4gMCkgQS5sYXRlKys7CiAgICBBLmhlYWQgPSBub3cgKyAwLjA2OwogIH0KICBzcmMuc3RhcnQoQS5oZWFkKTsgICAgICAgICAgICAgICAgICAgIC8vIHNhbXBsZS1hY2N1cmF0ZTogaGVhZCBhZHZhbmNlcyBieSBleGFjdCBidWZmZXIgZHVyYXRpb24KICBBLmhlYWQgKz0gYnVmLmR1cmF0aW9uOwogIEEuc291cmNlcy5wdXNoKHNyYyk7Cn0KZnVuY3Rpb24gZ28oKSB7CiAgaWYgKEEuc3RhcnRlZCkgcmV0dXJuOwogIEEuc3RhcnRlZCA9IHRydWU7IEEuaGVhZCA9IE1hdGgubWF4KEEuaGVhZCwgQS5jdHguY3VycmVudFRpbWUgKyAwLjA4KTsKICBmb3IgKGNvbnN0IGYgb2YgQS5xdWV1ZSkgc2NoZWR1bGUoZik7CiAgQS5xdWV1ZSA9IFtdOwp9CgpmdW5jdGlvbiBidWJibGUoY2xzLCB0ZXh0KSB7CiAgY29uc3QgZCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpOyBkLmNsYXNzTmFtZSA9ICJtICIgKyBjbHM7IGQudGV4dENvbnRlbnQgPSB0ZXh0OwogICQoIiNsb2ciKS5hcHBlbmRDaGlsZChkKTsgJCgiI2xvZyIpLnNjcm9sbFRvcCA9IDFlOTsgcmV0dXJuIGQ7Cn0KCmFzeW5jIGZ1bmN0aW9uIHNlbmQodGV4dCkgewogIGVuc3VyZUN0eChBLnNyKTsgYXdhaXQgQS5jdHgucmVzdW1lKCk7IHJlc2V0QXVkaW8oKTsgcGxheUZpbGxlcigpOwogIGJ1YmJsZSgidSIsIHRleHQpOwogIGNvbnN0IG91dCA9IGJ1YmJsZSgiYSIsICIiKTsgY29uc3QgbWV0YSA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpOyBtZXRhLmNsYXNzTmFtZSA9ICJtZXRhIjsgb3V0LmFwcGVuZENoaWxkKG1ldGEpOwogIGNvbnN0IGJvZHkgPSBkb2N1bWVudC5jcmVhdGVUZXh0Tm9kZSgiIik7IG91dC5pbnNlcnRCZWZvcmUoYm9keSwgbWV0YSk7CiAgY3RybCA9IG5ldyBBYm9ydENvbnRyb2xsZXIoKTsKICAkKCIjc2VuZCIpLmRpc2FibGVkID0gdHJ1ZTsgJCgiI3N0b3AiKS5kaXNhYmxlZCA9IGZhbHNlOwogIHRyeSB7CiAgICBjb25zdCByZXMgPSBhd2FpdCBmZXRjaCgiL2NoYXQiLCB7bWV0aG9kOiAiUE9TVCIsIGhlYWRlcnM6IHsiQ29udGVudC1UeXBlIjogImFwcGxpY2F0aW9uL2pzb24ifSwKICAgICAgYm9keTogSlNPTi5zdHJpbmdpZnkoe21lc3NhZ2U6IHRleHQsIG1vZGU6ICQoIiNtb2RlIikudmFsdWV9KSwgc2lnbmFsOiBjdHJsLnNpZ25hbH0pOwogICAgY29uc3QgcmQgPSByZXMuYm9keS5nZXRSZWFkZXIoKSwgZGVjID0gbmV3IFRleHREZWNvZGVyKCk7IGxldCBidWYgPSAiIjsKICAgIGZvciAoOzspIHsKICAgICAgY29uc3Qge3ZhbHVlLCBkb25lfSA9IGF3YWl0IHJkLnJlYWQoKTsgaWYgKGRvbmUpIGJyZWFrOwogICAgICBidWYgKz0gZGVjLmRlY29kZSh2YWx1ZSwge3N0cmVhbTogdHJ1ZX0pOwogICAgICBsZXQgaTsKICAgICAgd2hpbGUgKChpID0gYnVmLmluZGV4T2YoIlxuIikpID49IDApIHsKICAgICAgICBjb25zdCBsaW5lID0gYnVmLnNsaWNlKDAsIGkpOyBidWYgPSBidWYuc2xpY2UoaSArIDEpOwogICAgICAgIGlmIChsaW5lLnRyaW0oKSkgaGFuZGxlKEpTT04ucGFyc2UobGluZSksIGJvZHksIG1ldGEpOwogICAgICB9CiAgICB9CiAgfSBjYXRjaCAoZSkgewogICAgaWYgKGUubmFtZSAhPT0gIkFib3J0RXJyb3IiKSB7IG1ldGEudGV4dENvbnRlbnQgPSAiQ29ubmVjdGlvbiBwcm9ibGVtOiAiICsgZS5tZXNzYWdlOyBjb25zb2xlLmVycm9yKGUpOyB9CiAgfQogIGlmICghQS5zdGFydGVkICYmIEEucXVldWUubGVuZ3RoKSBnbygpOyAgIC8vIGZhbGxiYWNrOiBuZXZlciBsZWF2ZSBhdWRpbyB1bnBsYXllZAogIGZldGNoKCIvZmVlZGJhY2siLCB7bWV0aG9kOiAiUE9TVCIsIGhlYWRlcnM6IHsiQ29udGVudC1UeXBlIjogImFwcGxpY2F0aW9uL2pzb24ifSwgYm9keTogSlNPTi5zdHJpbmdpZnkoe2xhdGU6IEEubGF0ZX0pfSkKICAgIC5jYXRjaChlID0+IGNvbnNvbGUud2FybigiZmVlZGJhY2siLCBlKSk7CiAgJCgiI3N0YXR1cyIpLnRleHRDb250ZW50ID0gIiI7ICQoIiNzZW5kIikuZGlzYWJsZWQgPSBmYWxzZTsgJCgiI3N0b3AiKS5kaXNhYmxlZCA9IHRydWU7ICQoIiNxIikuZm9jdXMoKTsKfQoKZnVuY3Rpb24gaGFuZGxlKGV2LCBib2R5LCBtZXRhKSB7CiAgc3dpdGNoIChldi50eXBlKSB7CiAgICBjYXNlICJtZXRhIjoKICAgICAgaWYgKGV2LnNhbXBsZV9yYXRlICE9PSBBLnNyKSB7IGVuc3VyZUN0eChldi5zYW1wbGVfcmF0ZSk7IEEuY3R4LnJlc3VtZSgpOyB9CiAgICAgICQoIiNjaGlwIikudGV4dENvbnRlbnQgPSBldi5iYWNrZW5kOyBicmVhazsKICAgIGNhc2UgInRleHQiOiBib2R5Lm5vZGVWYWx1ZSArPSBldi5kZWx0YTsgJCgiI2xvZyIpLnNjcm9sbFRvcCA9IDFlOTsgYnJlYWs7CiAgICBjYXNlICJzdGF0dXMiOiAkKCIjc3RhdHVzIikudGV4dENvbnRlbnQgPSAiUHJlcGFyaW5nIHZvaWNlLCBzZW50ZW5jZSAiICsgKGV2LmkgKyAxKTsgYnJlYWs7CiAgICBjYXNlICJzZW50ZW5jZV9hdWRpbyI6IHsKICAgICAgY29uc3QgZiA9IGZhZGUocGNtVG9GMzIoZXYucGNtKSwgMywgMyk7CiAgICAgIGlmIChBLnN0YXJ0ZWQpIHNjaGVkdWxlKGYpOyBlbHNlIEEucXVldWUucHVzaChmKTsKICAgICAgYnJlYWs7IH0KICAgIGNhc2UgImdvIjogZ28oKTsgJCgiI3N0YXR1cyIpLnRleHRDb250ZW50ID0gIlNwZWFraW5nIjsgYnJlYWs7CiAgICBjYXNlICJhdWRpb19mdWxsIjogewogICAgICBjb25zdCBmID0gZmFkZShwY21Ub0YzMihldi5wY20pLCA1LCAxNSk7CiAgICAgIEEucXVldWUucHVzaChmKTsgZ28oKTsgJCgiI3N0YXR1cyIpLnRleHRDb250ZW50ID0gIlNwZWFraW5nIjsgYnJlYWs7IH0KICAgIGNhc2UgImVycm9yIjogbWV0YS50ZXh0Q29udGVudCA9IGV2Lm1lc3NhZ2U7IGJyZWFrOwogICAgY2FzZSAibWV0cmljcyI6IHsKICAgICAgY29uc3QgbSA9IGV2OwogICAgICBtZXRhLnRleHRDb250ZW50ID0gKG0udG9rX3MgPz8gIj8iKSArICIgdG9rL3MsIGZpcnN0IHRleHQgIiArIChtLnR0ZnRfcyA/PyAiPyIpICsgIiBzLCB2b2ljZSBzdGFydHMgIiArIChtLmF1ZGlvX3N0YXJ0X3MgPz8gIm4vYSIpICsgIiBzLCB2b2ljZSBidWlsdCBhdCAiICsgKG0udHRzX3dhbGxfcGVyX2F1ZGlvID8/ICJuL2EiKSArICJ4IGF1ZGlvIGxlbmd0aCwgIiArIG0ubW9kZTsKICAgICAgYnJlYWs7IH0KICAgIGNhc2UgImRvbmUiOiBicmVhazsKICB9Cn0KCiQoIiNmIikuYWRkRXZlbnRMaXN0ZW5lcigic3VibWl0IiwgZSA9PiB7IGUucHJldmVudERlZmF1bHQoKTsgY29uc3QgdCA9ICQoIiNxIikudmFsdWUudHJpbSgpOyBpZiAoIXQpIHJldHVybjsgJCgiI3EiKS52YWx1ZSA9ICIiOyBzZW5kKHQpOyB9KTsKJCgiI3N0b3AiKS5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsICgpID0+IHsgZmV0Y2goIi9jYW5jZWwiLCB7bWV0aG9kOiAiUE9TVCJ9KTsgaWYgKGN0cmwpIGN0cmwuYWJvcnQoKTsgcmVzZXRBdWRpbygpOyB9KTsKJCgiI3Jlc2V0IikuYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCBhc3luYyAoKSA9PiB7IGF3YWl0IGZldGNoKCIvcmVzZXQiLCB7bWV0aG9kOiAiUE9TVCJ9KTsgJCgiI2xvZyIpLmlubmVySFRNTCA9ICIiOyByZXNldEF1ZGlvKCk7IH0pOwpmZXRjaCgiL2NvbmZpZyIpLnRoZW4ociA9PiByLmpzb24oKSkudGhlbihjID0+IHsgQS5zciA9IGMuc2FtcGxlX3JhdGU7ICQoIiNtb2RlIikudmFsdWUgPSBjLmF1ZGlvX21vZGU7ICQoIiNjaGlwIikudGV4dENvbnRlbnQgPSBjLmJhY2tlbmQgKyAiIC8gIiArIGMubW9kZWw7IH0pCiAgLmNhdGNoKGUgPT4geyAkKCIjY2hpcCIpLnRleHRDb250ZW50ID0gInNlcnZlciBub3QgcmVhY2hhYmxlIjsgY29uc29sZS5lcnJvcihlKTsgfSk7Cjwvc2NyaXB0PjwvYm9keT48L2h0bWw+Cg=="
 def load_ui():
     try:
         return (HERE / "_ui.html").read_text(encoding="utf-8")
@@ -724,6 +926,10 @@ def build_app():
     def config():
         return {"audio_mode": AUDIO_MODE, "sample_rate": TTS.sample_rate, "backend": TTS.name,
                 "model": MODEL_FILE, "safety": PACE.safety}
+
+    @app.get("/fillers")
+    def fillers():
+        return FILLERS
 
     @app.post("/chat")
     async def chat(req: Request):

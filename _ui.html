@@ -12,6 +12,7 @@ header{display:flex;align-items:center;gap:10px;padding:14px 4px;border-bottom:1
 h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.2px}
 #chip{color:var(--mut);font-size:13px;flex:1}
 select,button,input{font:inherit;color:var(--fg)}
+label.chk{font-size:13px;color:var(--mut);display:flex;gap:4px;align-items:center}
 select{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:6px 8px}
 #log{flex:1;overflow-y:auto;padding:16px 2px;display:flex;flex-direction:column;gap:12px}
 .m{max-width:88%;padding:10px 14px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
@@ -29,7 +30,7 @@ button:disabled{opacity:.5;cursor:default}
 <body>
 <header><h1>neo-tts</h1><span id="chip">connecting</span>
 <select id="mode" title="Audio mode"><option value="adaptive">Adaptive</option><option value="smooth">Smooth</option><option value="stream">Stream</option></select>
-<button class="ghost" id="reset" type="button">New chat</button></header>
+<label class="chk"><input type="checkbox" id="fill" checked> Quick ack</label><button class="ghost" id="reset" type="button">New chat</button></header>
 <div id="log" aria-live="polite"></div>
 <div id="status"></div>
 <form id="f"><input id="q" autocomplete="off" placeholder="Type a message" aria-label="Message"><button id="send">Send</button><button class="ghost" id="stop" type="button" disabled>Stop</button></form>
@@ -37,7 +38,15 @@ button:disabled{opacity:.5;cursor:default}
 "use strict";
 const $ = s => document.querySelector(s);
 const A = {ctx: null, sr: 24000, head: 0, started: false, queue: [], late: 0, sources: []};
-let ctrl = null;
+let ctrl = null, fillers = [], fi = 0;
+fetch("/fillers").then(r => r.json()).then(f => { fillers = f; }).catch(e => console.warn("fillers", e));
+function playFiller() {
+  if (!$("#fill").checked || !fillers.length) return;
+  const f = fillers[fi++ % fillers.length];
+  if (f.sr !== A.sr) return;
+  A.head = A.ctx.currentTime + 0.03;    // plays at once, before the server has produced anything
+  schedule(fade(pcmToF32(f.pcm), 3, 10));
+}
 
 function ensureCtx(sr) {
   if (A.ctx && A.ctx.sampleRate === sr) return;
@@ -81,7 +90,7 @@ function schedule(f) {
 }
 function go() {
   if (A.started) return;
-  A.started = true; A.head = A.ctx.currentTime + 0.08;
+  A.started = true; A.head = Math.max(A.head, A.ctx.currentTime + 0.08);
   for (const f of A.queue) schedule(f);
   A.queue = [];
 }
@@ -92,7 +101,7 @@ function bubble(cls, text) {
 }
 
 async function send(text) {
-  ensureCtx(A.sr); await A.ctx.resume(); resetAudio();
+  ensureCtx(A.sr); await A.ctx.resume(); resetAudio(); playFiller();
   bubble("u", text);
   const out = bubble("a", ""); const meta = document.createElement("div"); meta.className = "meta"; out.appendChild(meta);
   const body = document.createTextNode(""); out.insertBefore(body, meta);

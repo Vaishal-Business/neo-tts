@@ -191,9 +191,6 @@ def ensure_py_deps():
     for mod, pkg in (("fastapi", "fastapi"), ("uvicorn", "uvicorn"), ("numpy", "numpy"), ("pocket_tts", "pocket-tts")):
         if importlib.util.find_spec(mod) is None:
             need.append(pkg)
-    # int8 quantization backend for pocket-tts (real speedup on CPU)
-    if TTS_BACKEND == "pocket" and importlib.util.find_spec("torchao") is None:
-        need.append("torchao>=0.16.0")
     if TTS_BACKEND == "kokoro" and importlib.util.find_spec("kokoro_onnx") is None:
         need.append("kokoro-onnx")
     if need:
@@ -271,13 +268,10 @@ class PocketBackend(TTSBackend):
         torch.set_num_threads(2)
         from pocket_tts import TTSModel
         try:
-            self.model = TTSModel.load_model(quantize=True)   # int8 via torchao / torch.ao
-            log("pocket-tts loaded with int8 quantization")
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to load quantized pocket-tts model. "
-                "Install a recent pocket-tts and torchao>=0.16.0. Error: " + repr(e)
-            )
+            self.model = TTSModel.load_model(quantize=True)   # int8
+        except TypeError as e:
+            log(f"load_model(quantize=True) unsupported ({e}); loading fp32")
+            self.model = TTSModel.load_model()
         vp = find_voice()
         if vp is None:
             log("WARNING: voice.safetensors not found; using the built-in default voice")
@@ -660,19 +654,43 @@ def start_server():
         return url
     _FRESH = True
     boot_models()
-    import uvicorn
+    import uvicorn, socket
+    global PORT
+    # A previous run in this same kernel may still hold the port (its daemon thread
+    # survives re-runs and %run gives each run fresh globals). Never fight for it.
+    for cand in range(PORT, PORT + 10):
+        sk = socket.socket()
+        try:
+            sk.bind(("127.0.0.1", cand)); free = True
+        except OSError:
+            free = False
+        finally:
+            sk.close()
+        if free:
+            if cand != PORT:
+                log(f"port {PORT} is busy (stale server from an earlier run); using {cand}")
+            PORT = cand
+            break
+    else:
+        raise RuntimeError("no free port in range; restart the runtime")
     cfg = uvicorn.Config(build_app(), host="127.0.0.1", port=PORT, log_config=LOG_CONFIG,
                          access_log=False, log_level="critical")
     SERVER = uvicorn.Server(cfg)
-    threading.Thread(target=SERVER.run, daemon=True, name="neo-uvicorn").start()
-    for _ in range(300):   # up to 60 s: first quantized load can take a while
+    errs = []
+    def _run():
+        try:
+            SERVER.run()
+        except BaseException as e:   # SystemExit on bind failure is otherwise invisible (loggers are silenced)
+            errs.append(repr(e)); print(f"[uvicorn] crashed: {e!r}", flush=True)
+    th = threading.Thread(target=_run, daemon=True, name="neo-uvicorn")
+    th.start()
+    for _ in range(150):
         if alive(): break
+        if not th.is_alive():
+            raise RuntimeError(f"uvicorn thread exited before serving: {errs or 'no exception (port bind failed?)'}")
         time.sleep(0.2)
     else:
-        raise RuntimeError(
-            "server did not become healthy after 60 s "
-            "(check uvicorn/TTS boot logs and /tmp/cloudflared.log)"
-        )
+        raise RuntimeError("server not healthy after 30 s")
     log("server healthy; opening tunnel")
     url = start_tunnel(ensure_cloudflared())
     if not url:

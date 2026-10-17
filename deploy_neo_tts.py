@@ -191,6 +191,9 @@ def ensure_py_deps():
     for mod, pkg in (("fastapi", "fastapi"), ("uvicorn", "uvicorn"), ("numpy", "numpy"), ("pocket_tts", "pocket-tts")):
         if importlib.util.find_spec(mod) is None:
             need.append(pkg)
+    # int8 quantization backend for pocket-tts (real speedup on CPU)
+    if TTS_BACKEND == "pocket" and importlib.util.find_spec("torchao") is None:
+        need.append("torchao>=0.16.0")
     if TTS_BACKEND == "kokoro" and importlib.util.find_spec("kokoro_onnx") is None:
         need.append("kokoro-onnx")
     if need:
@@ -268,10 +271,13 @@ class PocketBackend(TTSBackend):
         torch.set_num_threads(2)
         from pocket_tts import TTSModel
         try:
-            self.model = TTSModel.load_model(quantize=True)   # int8
-        except TypeError as e:
-            log(f"load_model(quantize=True) unsupported ({e}); loading fp32")
-            self.model = TTSModel.load_model()
+            self.model = TTSModel.load_model(quantize=True)   # int8 via torchao / torch.ao
+            log("pocket-tts loaded with int8 quantization")
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load quantized pocket-tts model. "
+                "Install a recent pocket-tts and torchao>=0.16.0. Error: " + repr(e)
+            )
         vp = find_voice()
         if vp is None:
             log("WARNING: voice.safetensors not found; using the built-in default voice")
@@ -659,11 +665,14 @@ def start_server():
                          access_log=False, log_level="critical")
     SERVER = uvicorn.Server(cfg)
     threading.Thread(target=SERVER.run, daemon=True, name="neo-uvicorn").start()
-    for _ in range(100):
+    for _ in range(300):   # up to 60 s: first quantized load can take a while
         if alive(): break
         time.sleep(0.2)
     else:
-        raise RuntimeError("server did not become healthy")
+        raise RuntimeError(
+            "server did not become healthy after 60 s "
+            "(check uvicorn/TTS boot logs and /tmp/cloudflared.log)"
+        )
     log("server healthy; opening tunnel")
     url = start_tunnel(ensure_cloudflared())
     if not url:

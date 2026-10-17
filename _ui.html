@@ -126,7 +126,7 @@ function handle(ev, body, meta) {
       if (ev.sample_rate !== A.sr) { ensureCtx(ev.sample_rate); A.ctx.resume(); }
       $("#chip").textContent = ev.backend; break;
     case "text": body.nodeValue += ev.delta; $("#log").scrollTop = 1e9; break;
-    case "status": $("#status").textContent = "Preparing voice, sentence " + (ev.i + 1) + " of " + ev.n; break;
+    case "status": $("#status").textContent = "Preparing voice, sentence " + (ev.i + 1); break;
     case "sentence_audio": {
       const f = fade(pcmToF32(ev.pcm), 3, 3);
       if (A.started) schedule(f); else A.queue.push(f);

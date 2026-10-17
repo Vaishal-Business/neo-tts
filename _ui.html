@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>neo-tts</title>
+<style>
+:root{--bg:#12151a;--panel:#1a1e25;--fg:#e9ebf0;--mut:#8e97a8;--line:#2a303b;--acc:#7fd6c2;--me:#232a36}
+@media (prefers-color-scheme:light){:root{--bg:#f4f5f7;--panel:#fff;--fg:#161a21;--mut:#5f6879;--line:#dde1e9;--acc:#0f7f6a;--me:#e8ecf3}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column;max-width:760px;margin:0 auto;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+header{display:flex;align-items:center;gap:10px;padding:14px 4px;border-bottom:1px solid var(--line)}
+h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.2px}
+#chip{color:var(--mut);font-size:13px;flex:1}
+select,button,input{font:inherit;color:var(--fg)}
+select{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:6px 8px}
+#log{flex:1;overflow-y:auto;padding:16px 2px;display:flex;flex-direction:column;gap:12px}
+.m{max-width:88%;padding:10px 14px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
+.u{align-self:flex-end;background:var(--me)}
+.a{align-self:flex-start;background:var(--panel);border:1px solid var(--line)}
+.meta{font-size:12px;color:var(--mut);margin-top:6px}
+#status{min-height:20px;font-size:13px;color:var(--acc);padding:0 4px}
+form{display:flex;gap:8px;padding:10px 0 14px}
+input{flex:1;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+input:focus-visible,button:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+button{background:var(--acc);color:#0b1210;border:0;border-radius:12px;padding:0 18px;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:default}
+</style></head>
+<body>
+<header><h1>neo-tts</h1><span id="chip">connecting</span>
+<select id="mode" title="Audio mode"><option value="adaptive">Adaptive</option><option value="smooth">Smooth</option><option value="stream">Stream</option></select>
+<button class="ghost" id="reset" type="button">New chat</button></header>
+<div id="log" aria-live="polite"></div>
+<div id="status"></div>
+<form id="f"><input id="q" autocomplete="off" placeholder="Type a message" aria-label="Message"><button id="send">Send</button><button class="ghost" id="stop" type="button" disabled>Stop</button></form>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const A = {ctx: null, sr: 24000, head: 0, started: false, queue: [], late: 0, sources: []};
+let ctrl = null;
+
+function ensureCtx(sr) {
+  if (A.ctx && A.ctx.sampleRate === sr) return;
+  if (A.ctx) A.ctx.close();
+  A.sr = sr;
+  // Fixed 24 kHz context: the default 48 kHz context resamples our buffers and crackles.
+  A.ctx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: sr, latencyHint: "playback"});
+}
+function resetAudio() {
+  for (const s of A.sources) { try { s.stop(); } catch (e) { console.warn("stop", e); } }
+  A.sources = []; A.head = 0; A.started = false; A.queue = []; A.late = 0;
+}
+function pcmToF32(b64) {
+  const bin = atob(b64), n = bin.length >> 1, out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v & 0x8000) v -= 0x10000;
+    out[i] = v / 32768;
+  }
+  return out;
+}
+function fade(f, inMs, outMs) {
+  const ni = Math.min(f.length >> 1, Math.round(A.sr * inMs / 1000)), no = Math.min(f.length >> 1, Math.round(A.sr * outMs / 1000));
+  for (let i = 0; i < ni; i++) f[i] *= i / ni;
+  for (let i = 0; i < no; i++) f[f.length - 1 - i] *= i / no;
+  return f;
+}
+function schedule(f) {
+  const buf = A.ctx.createBuffer(1, f.length, A.sr);
+  buf.copyToChannel(f, 0);
+  const src = A.ctx.createBufferSource();
+  src.buffer = buf; src.connect(A.ctx.destination);
+  const now = A.ctx.currentTime;
+  if (A.head < now + 0.01) {            // chunk arrived after the queue ran dry: an audible gap
+    if (A.started && A.head > 0) A.late++;
+    A.head = now + 0.06;
+  }
+  src.start(A.head);                    // sample-accurate: head advances by exact buffer duration
+  A.head += buf.duration;
+  A.sources.push(src);
+}
+function go() {
+  if (A.started) return;
+  A.started = true; A.head = A.ctx.currentTime + 0.08;
+  for (const f of A.queue) schedule(f);
+  A.queue = [];
+}
+
+function bubble(cls, text) {
+  const d = document.createElement("div"); d.className = "m " + cls; d.textContent = text;
+  $("#log").appendChild(d); $("#log").scrollTop = 1e9; return d;
+}
+
+async function send(text) {
+  ensureCtx(A.sr); await A.ctx.resume(); resetAudio();
+  bubble("u", text);
+  const out = bubble("a", ""); const meta = document.createElement("div"); meta.className = "meta"; out.appendChild(meta);
+  const body = document.createTextNode(""); out.insertBefore(body, meta);
+  ctrl = new AbortController();
+  $("#send").disabled = true; $("#stop").disabled = false;
+  try {
+    const res = await fetch("/chat", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({message: text, mode: $("#mode").value}), signal: ctrl.signal});
+    const rd = res.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const {value, done} = await rd.read(); if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        if (line.trim()) handle(JSON.parse(line), body, meta);
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") { meta.textContent = "Connection problem: " + e.message; console.error(e); }
+  }
+  if (!A.started && A.queue.length) go();   // fallback: never leave audio unplayed
+  fetch("/feedback", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({late: A.late})})
+    .catch(e => console.warn("feedback", e));
+  $("#status").textContent = ""; $("#send").disabled = false; $("#stop").disabled = true; $("#q").focus();
+}
+
+function handle(ev, body, meta) {
+  switch (ev.type) {
+    case "meta":
+      if (ev.sample_rate !== A.sr) { ensureCtx(ev.sample_rate); A.ctx.resume(); }
+      $("#chip").textContent = ev.backend; break;
+    case "text": body.nodeValue += ev.delta; $("#log").scrollTop = 1e9; break;
+    case "status": $("#status").textContent = "Preparing voice, sentence " + (ev.i + 1) + " of " + ev.n; break;
+    case "sentence_audio": {
+      const f = fade(pcmToF32(ev.pcm), 3, 3);
+      if (A.started) schedule(f); else A.queue.push(f);
+      break; }
+    case "go": go(); $("#status").textContent = "Speaking"; break;
+    case "audio_full": {
+      const f = fade(pcmToF32(ev.pcm), 5, 15);
+      A.queue.push(f); go(); $("#status").textContent = "Speaking"; break; }
+    case "error": meta.textContent = ev.message; break;
+    case "metrics": {
+      const m = ev;
+      meta.textContent = (m.tok_s ?? "?") + " tok/s, first text " + (m.ttft_s ?? "?") + " s, voice starts " + (m.audio_start_s ?? "n/a") + " s, voice built at " + (m.tts_wall_per_audio ?? "n/a") + "x audio length, " + m.mode;
+      break; }
+    case "done": break;
+  }
+}
+
+$("#f").addEventListener("submit", e => { e.preventDefault(); const t = $("#q").value.trim(); if (!t) return; $("#q").value = ""; send(t); });
+$("#stop").addEventListener("click", () => { fetch("/cancel", {method: "POST"}); if (ctrl) ctrl.abort(); resetAudio(); });
+$("#reset").addEventListener("click", async () => { await fetch("/reset", {method: "POST"}); $("#log").innerHTML = ""; resetAudio(); });
+fetch("/config").then(r => r.json()).then(c => { A.sr = c.sample_rate; $("#mode").value = c.audio_mode; $("#chip").textContent = c.backend + " / " + c.model; })
+  .catch(e => { $("#chip").textContent = "server not reachable"; console.error(e); });
+</script></body></html>

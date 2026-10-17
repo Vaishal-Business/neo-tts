@@ -29,7 +29,7 @@ button:disabled{opacity:.5;cursor:default}
 </style></head>
 <body>
 <header><h1>neo-tts</h1><span id="chip">connecting</span>
-<select id="mode" title="Audio mode"><option value="adaptive">Adaptive</option><option value="smooth">Smooth</option><option value="stream">Stream</option></select>
+<select id="mode" title="Audio mode"><option value="adaptive">Adaptive (safe start)</option><option value="stream">Live (speak at once)</option><option value="smooth">Smooth (after full reply)</option></select>
 <label class="chk"><input type="checkbox" id="fill" checked> Quick ack</label><button class="ghost" id="reset" type="button">New chat</button></header>
 <div id="log" aria-live="polite"></div>
 <div id="status"></div>
